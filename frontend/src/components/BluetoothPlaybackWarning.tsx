@@ -79,15 +79,9 @@ export function BluetoothPlaybackWarning({
             Recordings may sound distorted or sped up through Bluetooth devices.
             For accurate review, please use <strong>computer speakers</strong> or{' '}
             <strong>wired headphones</strong>.
-            <br />
-            <a
-              href="https://github.com/your-org/meetily/blob/main/BLUETOOTH_PLAYBACK_NOTICE.md"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="underline hover:text-yellow-900 font-medium mt-2 inline-block"
-            >
-              Learn why this happens →
-            </a>
+            <span className="block mt-2 font-medium">
+              This warning reflects a platform playback limitation, not a Voxora recording issue.
+            </span>
           </AlertDescription>
         </div>
         <Button

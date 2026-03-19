@@ -1,646 +1,514 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from __future__ import annotations
+
+import logging
+import os
+import tempfile
+from pathlib import Path
+from typing import Iterable
+
+import httpx
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import uvicorn
-from typing import Optional, List
-import logging
-from dotenv import load_dotenv
-from db import DatabaseManager
-import json
-from threading import Lock
-from transcript_processor import TranscriptProcessor
-import time
+from pydantic import BaseModel, Field
 
-# Load environment variables
-load_dotenv()
 
-# Configure logger with line numbers and function names
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+APP_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = APP_DIR.parent
 
-# Create console handler with formatting
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
+load_dotenv(BACKEND_DIR / ".env")
 
-# Create formatter with line numbers and function names
-formatter = logging.Formatter(
-    '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d - %(funcName)s()] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-console_handler.setFormatter(formatter)
 
-# Add handler to logger if not already added
+logger = logging.getLogger("voxora.backend")
 if not logger.handlers:
-    logger.addHandler(console_handler)
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
-app = FastAPI(
-    title="Meeting Summarizer API",
-    description="API for processing and summarizing meeting transcripts",
-    version="1.0.0"
-)
 
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],     # Allow all origins for testing
-    allow_credentials=True,
-    allow_methods=["*"],     # Allow all methods
-    allow_headers=["*"],     # Allow all headers
-    max_age=3600,            # Cache preflight requests for 1 hour
-)
+ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".mpeg", ".mp4", ".webm"}
+PLACEHOLDER_VALUES = {"api_key_here", "gapi_key_here", ""}
+SUPPORTED_PROVIDERS = ("openai", "groq")
 
-# Global database manager instance for meeting management endpoints
-db = DatabaseManager()
+DEFAULT_OPENAI_TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
+DEFAULT_OPENAI_SUMMARY_MODEL = os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
+DEFAULT_GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3")
+DEFAULT_GROQ_SUMMARY_MODEL = os.getenv("GROQ_SUMMARY_MODEL", "llama-3.1-8b-instant")
+DEFAULT_PROVIDER = os.getenv("DEFAULT_AI_PROVIDER", "auto")
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
+MAX_SUMMARY_CHUNK_CHARS = int(os.getenv("SUMMARY_CHUNK_CHARS", "12000"))
+SUMMARY_CHUNK_OVERLAP = int(os.getenv("SUMMARY_CHUNK_OVERLAP", "500"))
 
-# New Pydantic models for meeting management
-class Transcript(BaseModel):
-    id: str
-    text: str
-    timestamp: str
-    # Recording-relative timestamps for audio-transcript synchronization
-    audio_start_time: Optional[float] = None
-    audio_end_time: Optional[float] = None
-    duration: Optional[float] = None
 
-class MeetingResponse(BaseModel):
-    id: str
-    title: str
+class SummarizeTranscriptRequest(BaseModel):
+    transcript: str = Field(min_length=1)
+    provider: str = Field(default=DEFAULT_PROVIDER)
+    summary_model: str | None = None
 
-class MeetingDetailsResponse(BaseModel):
-    id: str
-    title: str
-    created_at: str
-    updated_at: str
-    transcripts: List[Transcript]
 
-class MeetingTitleUpdate(BaseModel):
-    meeting_id: str
-    title: str
-
-class DeleteMeetingRequest(BaseModel):
-    meeting_id: str
-
-class SaveTranscriptRequest(BaseModel):
-    meeting_title: str
-    transcripts: List[Transcript]
-    folder_path: Optional[str] = None  # NEW: Path to meeting folder (for new folder structure)
-
-class SaveModelConfigRequest(BaseModel):
+class ProcessAudioResponse(BaseModel):
     provider: str
-    model: str
-    whisperModel: str
-    apiKey: Optional[str] = None
+    transcription_model: str
+    summary_model: str
+    filename: str
+    transcript: str
+    summary: str
 
-class SaveTranscriptConfigRequest(BaseModel):
-    provider: str
-    model: str
-    apiKey: Optional[str] = None
 
-class TranscriptRequest(BaseModel):
-    """Request model for transcript text, updated with meeting_id"""
-    text: str
-    model: str
-    model_name: str
-    meeting_id: str
-    chunk_size: Optional[int] = 5000
-    overlap: Optional[int] = 1000
-    custom_prompt: Optional[str] = "Generate a summary of the meeting transcript."
+def _is_configured(value: str | None) -> bool:
+    return bool(value and value.strip() and value.strip() not in PLACEHOLDER_VALUES)
 
-class SummaryProcessor:
-    """Handles the processing of summaries in a thread-safe way"""
-    def __init__(self):
-        try:
-            self.db = DatabaseManager()
 
-            logger.info("Initializing SummaryProcessor components")
-            self.transcript_processor = TranscriptProcessor()
-            logger.info("SummaryProcessor initialized successfully (core components)")
-        except Exception as e:
-            logger.error(f"Failed to initialize SummaryProcessor: {str(e)}", exc_info=True)
-            raise
+def _get_cors_origins() -> list[str]:
+    raw = os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3118,http://127.0.0.1:3118",
+    ).strip()
+    if raw == "*":
+        return ["*"]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
-    async def process_transcript(self, text: str, model: str, model_name: str, chunk_size: int = 5000, overlap: int = 1000, custom_prompt: str = "Generate a summary of the meeting transcript.") -> tuple:
-        """Process a transcript text"""
-        try:
-            if not text:
-                raise ValueError("Empty transcript text provided")
 
-            # Validate chunk_size and overlap
-            if chunk_size <= 0:
-                raise ValueError("chunk_size must be positive")
-            if overlap < 0:
-                raise ValueError("overlap must be non-negative")
-            if overlap >= chunk_size:
-                overlap = chunk_size - 1  # Ensure overlap is less than chunk_size
+def _get_provider_api_key(provider: str) -> str | None:
+    env_var = {
+        "openai": "OPENAI_API_KEY",
+        "groq": "GROQ_API_KEY",
+    }.get(provider)
+    if not env_var:
+        return None
 
-            # Ensure step size is positive
-            step_size = chunk_size - overlap
-            if step_size <= 0:
-                chunk_size = overlap + 1  # Adjust chunk_size to ensure positive step
+    value = os.getenv(env_var)
+    return value if _is_configured(value) else None
 
-            logger.info(f"Processing transcript of length {len(text)} with chunk_size={chunk_size}, overlap={overlap}")
-            num_chunks, all_json_data = await self.transcript_processor.process_transcript(
-                text=text,
-                model=model,
-                model_name=model_name,
-                chunk_size=chunk_size,
-                overlap=overlap,
-                custom_prompt=custom_prompt
-            )
-            logger.info(f"Successfully processed transcript into {num_chunks} chunks")
 
-            return num_chunks, all_json_data
-        except Exception as e:
-            logger.error(f"Error processing transcript: {str(e)}", exc_info=True)
-            raise
+def _provider_preference_order() -> list[str]:
+    preferred = DEFAULT_PROVIDER.strip().lower()
+    if preferred in SUPPORTED_PROVIDERS:
+        return [preferred, *[candidate for candidate in SUPPORTED_PROVIDERS if candidate != preferred]]
+    return list(SUPPORTED_PROVIDERS)
 
-    def cleanup(self):
-        """Cleanup resources"""
-        try:
-            logger.info("Cleaning up resources")
-            if hasattr(self, 'transcript_processor'):
-                self.transcript_processor.cleanup()
-            logger.info("Cleanup completed successfully")
-        except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}", exc_info=True)
 
-# Initialize processor
-processor = SummaryProcessor()
+def _normalize_provider(provider: str) -> str:
+    normalized = (provider or DEFAULT_PROVIDER).strip().lower()
+    if normalized not in {"auto", *SUPPORTED_PROVIDERS}:
+        raise HTTPException(status_code=400, detail="Unsupported provider. Use 'auto', 'openai', or 'groq'.")
+    return normalized
 
-# New meeting management endpoints
-@app.get("/get-meetings", response_model=List[MeetingResponse])
-async def get_meetings():
-    """Get all meetings with their basic information"""
+
+def _resolve_provider(provider: str) -> str:
+    normalized = _normalize_provider(provider)
+    if normalized == "auto":
+        for candidate in _provider_preference_order():
+            if _get_provider_api_key(candidate):
+                return candidate
+        raise HTTPException(
+            status_code=400,
+            detail="No API key configured. Set OPENAI_API_KEY or GROQ_API_KEY on the backend.",
+        )
+
+    if not _get_provider_api_key(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{normalized.capitalize()} API key is not configured on the backend.",
+        )
+
+    return normalized
+
+
+def _default_transcription_model(provider: str) -> str:
+    if provider == "openai":
+        return DEFAULT_OPENAI_TRANSCRIPTION_MODEL
+    return DEFAULT_GROQ_TRANSCRIPTION_MODEL
+
+
+def _default_summary_model(provider: str) -> str:
+    if provider == "openai":
+        return DEFAULT_OPENAI_SUMMARY_MODEL
+    return DEFAULT_GROQ_SUMMARY_MODEL
+
+
+def _resolve_provider_candidates(provider: str) -> list[str]:
+    normalized = _normalize_provider(provider)
+    if normalized != "auto":
+        return [_resolve_provider(normalized)]
+
+    candidates = [candidate for candidate in _provider_preference_order() if _get_provider_api_key(candidate)]
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail="No API key configured. Set OPENAI_API_KEY or GROQ_API_KEY on the backend.",
+        )
+    return candidates
+
+
+def _can_auto_fallback(provider: str, *model_overrides: str | None) -> bool:
+    return _normalize_provider(provider) == "auto" and all(not override for override in model_overrides)
+
+
+def _should_try_next_provider(exc: HTTPException) -> bool:
+    return exc.status_code >= 500
+
+
+def _chunk_text(text: str, size: int, overlap: int) -> list[str]:
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    if len(cleaned) <= size:
+        return [cleaned]
+
+    chunks: list[str] = []
+    start = 0
+    step = max(1, size - overlap)
+    while start < len(cleaned):
+        end = min(len(cleaned), start + size)
+        chunks.append(cleaned[start:end])
+        if end >= len(cleaned):
+            break
+        start += step
+    return chunks
+
+
+async def _save_upload_to_temp(upload: UploadFile) -> tuple[Path, int]:
+    suffix = Path(upload.filename or "").suffix.lower()
+    if suffix not in ALLOWED_AUDIO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type. Allowed: {', '.join(sorted(ALLOWED_AUDIO_EXTENSIONS))}",
+        )
+
+    total_size = 0
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    temp_path = Path(temp_file.name)
+
     try:
-        meetings = await db.get_all_meetings()
-        return [{"id": meeting["id"], "title": meeting["title"]} for meeting in meetings]
-    except Exception as e:
-        logger.error(f"Error getting meetings: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/get-meeting/{meeting_id}", response_model=MeetingDetailsResponse)
-async def get_meeting(meeting_id: str):
-    """Get a specific meeting by ID with all its details"""
-    try:
-        meeting = await db.get_meeting(meeting_id)
-        if not meeting:
-            raise HTTPException(status_code=404, detail="Meeting not found")
-        return meeting
-    except HTTPException:
+        with temp_file:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_UPLOAD_MB * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail=f"File too large. Max upload size is {MAX_UPLOAD_MB} MB.")
+                temp_file.write(chunk)
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
         raise
-    except Exception as e:
-        logger.error(f"Error getting meeting: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await upload.close()
 
-@app.post("/save-meeting-title")
-async def save_meeting_title(data: MeetingTitleUpdate):
-    """Save a meeting title"""
+    return temp_path, total_size
+
+
+async def _request_transcription(
+    *,
+    file_path: Path,
+    filename: str,
+    content_type: str | None,
+    provider: str,
+    model: str,
+) -> str:
+    api_key = _get_provider_api_key(provider)
+    if not api_key:
+        raise HTTPException(status_code=400, detail=f"{provider.capitalize()} API key is not configured on the backend.")
+
+    if provider == "openai":
+        url = "https://api.openai.com/v1/audio/transcriptions"
+    else:
+        url = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+
     try:
-        await db.update_meeting_title(data.meeting_id, data.title)
-        return {"message": "Meeting title saved successfully"}
-    except Exception as e:
-        logger.error(f"Error saving meeting title: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            with file_path.open("rb") as audio_stream:
+                files = {"file": (filename, audio_stream, content_type or "application/octet-stream")}
+                data = {"model": model, "response_format": "verbose_json"}
+                response = await client.post(url, headers=headers, files=files, data=data)
+    except httpx.RequestError as exc:
+        logger.exception("Transcription request failed")
+        raise HTTPException(status_code=502, detail=f"Could not reach the {provider} transcription API.") from exc
 
-@app.post("/delete-meeting")
-async def delete_meeting(data: DeleteMeetingRequest):
-    """Delete a meeting and all its associated data"""
+    if response.status_code >= 400:
+        logger.error("Transcription API error %s: %s", response.status_code, response.text)
+        raise HTTPException(status_code=502, detail=f"{provider.capitalize()} transcription failed: {response.text}")
+
+    payload = response.json()
+    transcript = payload.get("text", "").strip()
+    if not transcript:
+        raise HTTPException(status_code=502, detail="Transcription returned an empty result.")
+    return transcript
+
+
+def _summary_system_prompt() -> str:
+    return (
+        "You are Voxora, an assistant that summarizes meeting transcripts. "
+        "Return concise markdown with these sections in order: "
+        "## Overview, ## Key Points, ## Action Items, ## Follow-ups. "
+        "Do not invent facts. If a section has nothing meaningful, say 'None noted.'"
+    )
+
+
+async def _request_chat_completion(
+    *,
+    provider: str,
+    model: str,
+    messages: Iterable[dict[str, str]],
+    max_tokens: int,
+) -> str:
+    api_key = _get_provider_api_key(provider)
+    if not api_key:
+        raise HTTPException(status_code=400, detail=f"{provider.capitalize()} API key is not configured on the backend.")
+
+    if provider == "openai":
+        url = "https://api.openai.com/v1/chat/completions"
+    else:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "temperature": 0.2,
+        "messages": list(messages),
+        "max_tokens": max_tokens,
+    }
+
     try:
-        success = await db.delete_meeting(data.meeting_id)
-        if success:
-            return {"message": "Meeting deleted successfully"}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to delete meeting")
-    except Exception as e:
-        logger.error(f"Error deleting meeting: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+    except httpx.RequestError as exc:
+        logger.exception("Summary request failed")
+        raise HTTPException(status_code=502, detail=f"Could not reach the {provider} summary API.") from exc
 
-async def process_transcript_background(process_id: str, transcript: TranscriptRequest, custom_prompt: str):
-    """Background task to process transcript"""
+    if response.status_code >= 400:
+        logger.error("Summary API error %s: %s", response.status_code, response.text)
+        raise HTTPException(status_code=502, detail=f"{provider.capitalize()} summary failed: {response.text}")
+
+    payload = response.json()
     try:
-        logger.info(f"Starting background processing for process_id: {process_id}")
-        
-        # Early validation for common issues
-        if not transcript.text or not transcript.text.strip():
-            raise ValueError("Empty transcript text provided")
-        
-        if transcript.model in ["claude", "groq", "openai"]:
-            # Check if API key is available for cloud providers
-            api_key = await processor.db.get_api_key(transcript.model)
-            if not api_key:
-                provider_names = {"claude": "Anthropic", "groq": "Groq", "openai": "OpenAI"}
-                raise ValueError(f"{provider_names.get(transcript.model, transcript.model)} API key not configured. Please set your API key in the model settings.")
+        message = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        logger.error("Unexpected summary response: %s", payload)
+        raise HTTPException(status_code=502, detail="Summary API returned an invalid response.") from exc
 
-        _, all_json_data = await processor.process_transcript(
-            text=transcript.text,
-            model=transcript.model,
-            model_name=transcript.model_name,
-            chunk_size=transcript.chunk_size,
-            overlap=transcript.overlap,
-            custom_prompt=custom_prompt
+    content = message.strip() if isinstance(message, str) else ""
+    if not content:
+        raise HTTPException(status_code=502, detail="Summary API returned an empty result.")
+    return content
+
+
+async def _build_summary(transcript: str, provider: str, summary_model: str) -> str:
+    chunks = _chunk_text(transcript, MAX_SUMMARY_CHUNK_CHARS, SUMMARY_CHUNK_OVERLAP)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Transcript is empty.")
+
+    if len(chunks) == 1:
+        return await _request_chat_completion(
+            provider=provider,
+            model=summary_model,
+            max_tokens=700,
+            messages=[
+                {"role": "system", "content": _summary_system_prompt()},
+                {"role": "user", "content": chunks[0]},
+            ],
         )
 
-        # Create final summary structure by aggregating chunk results
-        final_summary = {
-            "MeetingName": "",
-            "People": {"title": "People", "blocks": []},
-            "SessionSummary": {"title": "Session Summary", "blocks": []},
-            "CriticalDeadlines": {"title": "Critical Deadlines", "blocks": []},
-            "KeyItemsDecisions": {"title": "Key Items & Decisions", "blocks": []},
-            "ImmediateActionItems": {"title": "Immediate Action Items", "blocks": []},
-            "NextSteps": {"title": "Next Steps", "blocks": []},
-            # "OtherImportantPoints": {"title": "Other Important Points", "blocks": []},
-            # "ClosingRemarks": {"title": "Closing Remarks", "blocks": []},
-            "MeetingNotes": {
-                "meeting_name": "",
-                "sections": []
-            }
+    chunk_summaries: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        chunk_summary = await _request_chat_completion(
+            provider=provider,
+            model=summary_model,
+            max_tokens=400,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are summarizing one section of a longer meeting transcript. "
+                        "Return short markdown notes with headings: Overview, Key Points, Action Items, Follow-ups."
+                    ),
+                },
+                {"role": "user", "content": f"Chunk {index} of {len(chunks)}:\n\n{chunk}"},
+            ],
+        )
+        chunk_summaries.append(f"Chunk {index}\n{chunk_summary}")
+
+    return await _request_chat_completion(
+        provider=provider,
+        model=summary_model,
+        max_tokens=900,
+        messages=[
+            {"role": "system", "content": _summary_system_prompt()},
+            {
+                "role": "user",
+                "content": "Combine these chunk summaries into one final meeting summary:\n\n" + "\n\n".join(chunk_summaries),
+            },
+        ],
+    )
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="Voxora Web API",
+        version="1.0.0",
+        description="Upload-first transcription and meeting summarization API for Voxora Web.",
+    )
+
+    cors_origins = _get_cors_origins()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.exception_handler(HTTPException)
+    async def http_exception_handler(_, exc: HTTPException) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+    @app.get("/")
+    async def root() -> dict[str, str]:
+        return {"service": "voxora-web-api", "status": "ok"}
+
+    @app.get("/health")
+    async def health() -> dict[str, object]:
+        return {
+            "status": "ok",
+            "service": "voxora-web-api",
+            "providers": {
+                "openai": bool(_get_provider_api_key("openai")),
+                "groq": bool(_get_provider_api_key("groq")),
+            },
         }
 
-        # Process each chunk's data
-        for json_str in all_json_data:
+    @app.post("/api/transcribe-audio")
+    async def transcribe_audio(
+        file: UploadFile = File(...),
+        provider: str = Form(DEFAULT_PROVIDER),
+        model: str | None = Form(None),
+    ) -> dict[str, str]:
+        temp_path, _ = await _save_upload_to_temp(file)
+        provider_candidates = _resolve_provider_candidates(provider)
+        allow_fallback = _can_auto_fallback(provider, model)
+
+        try:
+            last_error: HTTPException | None = None
+            for index, resolved_provider in enumerate(provider_candidates):
+                transcription_model = model or _default_transcription_model(resolved_provider)
+                try:
+                    transcript = await _request_transcription(
+                        file_path=temp_path,
+                        filename=file.filename or temp_path.name,
+                        content_type=file.content_type,
+                        provider=resolved_provider,
+                        model=transcription_model,
+                    )
+                    return {
+                        "provider": resolved_provider,
+                        "model": transcription_model,
+                        "text": transcript,
+                    }
+                except HTTPException as exc:
+                    last_error = exc
+                    should_retry = allow_fallback and index < len(provider_candidates) - 1 and _should_try_next_provider(exc)
+                    if not should_retry:
+                        raise
+                    logger.warning("Auto provider fallback after %s transcription failure", resolved_provider)
+            if last_error:
+                raise last_error
+            raise HTTPException(status_code=500, detail="Unable to process transcription request.")
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    @app.post("/api/summarize-transcript")
+    async def summarize_transcript(payload: SummarizeTranscriptRequest) -> dict[str, str]:
+        provider_candidates = _resolve_provider_candidates(payload.provider)
+        allow_fallback = _can_auto_fallback(payload.provider, payload.summary_model)
+        last_error: HTTPException | None = None
+
+        for index, resolved_provider in enumerate(provider_candidates):
+            summary_model = payload.summary_model or _default_summary_model(resolved_provider)
             try:
-                json_dict = json.loads(json_str)
-                if "MeetingName" in json_dict and json_dict["MeetingName"]:
-                    final_summary["MeetingName"] = json_dict["MeetingName"]
-                for key in final_summary:
-                    if key == "MeetingNotes" and key in json_dict:
-                        # Handle MeetingNotes sections
-                        if isinstance(json_dict[key].get("sections"), list):
-                            # Ensure each section has blocks array
-                            for section in json_dict[key]["sections"]:
-                                if not section.get("blocks"):
-                                    section["blocks"] = []
-                            final_summary[key]["sections"].extend(json_dict[key]["sections"])
-                        if json_dict[key].get("meeting_name"):
-                            final_summary[key]["meeting_name"] = json_dict[key]["meeting_name"]
-                    elif key != "MeetingName" and key in json_dict and isinstance(json_dict[key], dict) and "blocks" in json_dict[key]:
-                        if isinstance(json_dict[key]["blocks"], list):
-                            final_summary[key]["blocks"].extend(json_dict[key]["blocks"])
-                            # Also add as a new section in MeetingNotes if not already present
-                            section_exists = False
-                            for section in final_summary["MeetingNotes"]["sections"]:
-                                if section["title"] == json_dict[key]["title"]:
-                                    section["blocks"].extend(json_dict[key]["blocks"])
-                                    section_exists = True
-                                    break
-                            
-                            if not section_exists:
-                                final_summary["MeetingNotes"]["sections"].append({
-                                    "title": json_dict[key]["title"],
-                                    "blocks": json_dict[key]["blocks"].copy() if json_dict[key]["blocks"] else []
-                                })
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON chunk for {process_id}: {e}. Chunk: {json_str[:100]}...")
-            except Exception as e:
-                logger.error(f"Error processing chunk data for {process_id}: {e}. Chunk: {json_str[:100]}...")
-
-        # Update database with meeting name using meeting_id
-        if final_summary["MeetingName"]:
-            await processor.db.update_meeting_name(transcript.meeting_id, final_summary["MeetingName"])
-
-        # Save final result
-        if all_json_data:
-            await processor.db.update_process(process_id, status="completed", result=json.dumps(final_summary))
-            logger.info(f"Background processing completed for process_id: {process_id}")
-        else:
-            error_msg = "Summary generation failed: No chunks were processed successfully. Check logs for specific errors."
-            await processor.db.update_process(process_id, status="failed", error=error_msg)
-            logger.error(f"Background processing failed for process_id: {process_id} - {error_msg}")
-
-    except ValueError as e:
-        # Handle specific value errors (like API key issues)
-        error_msg = str(e)
-        logger.error(f"Configuration error in background processing for {process_id}: {error_msg}", exc_info=True)
-        try:
-            await processor.db.update_process(process_id, status="failed", error=error_msg)
-        except Exception as db_e:
-            logger.error(f"Failed to update DB status to failed for {process_id}: {db_e}", exc_info=True)
-    except Exception as e:
-        # Handle all other exceptions
-        error_msg = f"Processing error: {str(e)}"
-        logger.error(f"Error in background processing for {process_id}: {error_msg}", exc_info=True)
-        try:
-            await processor.db.update_process(process_id, status="failed", error=error_msg)
-        except Exception as db_e:
-            logger.error(f"Failed to update DB status to failed for {process_id}: {db_e}", exc_info=True)
-
-@app.post("/process-transcript")
-async def process_transcript_api(
-    transcript: TranscriptRequest,
-    background_tasks: BackgroundTasks
-):
-    """Process a transcript text with background processing"""
-    try:
-        # Create new process linked to meeting_id
-        process_id = await processor.db.create_process(transcript.meeting_id)
-
-        # Save transcript data associated with meeting_id
-        await processor.db.save_transcript(
-            transcript.meeting_id,
-            transcript.text,
-            transcript.model,
-            transcript.model_name,
-            transcript.chunk_size,
-            transcript.overlap
-        )
-
-        custom_prompt = transcript.custom_prompt
-
-        # Start background processing
-        background_tasks.add_task(
-            process_transcript_background,
-            process_id,
-            transcript,
-            custom_prompt
-        )
-
-        return JSONResponse({
-            "message": "Processing started",
-            "process_id": process_id
-        })
-
-    except Exception as e:
-        logger.error(f"Error in process_transcript_api: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/get-summary/{meeting_id}")
-async def get_summary(meeting_id: str):
-    """Get the summary for a given meeting ID"""
-    try:
-        result = await processor.db.get_transcript_data(meeting_id)
-        if not result:
-            return JSONResponse(
-                status_code=404,
-                content={
-                    "status": "error",
-                    "meetingName": None,
-                    "meeting_id": meeting_id,
-                    "data": None,
-                    "start": None,
-                    "end": None,
-                    "error": "Meeting ID not found"
+                summary = await _build_summary(payload.transcript, resolved_provider, summary_model)
+                return {
+                    "provider": resolved_provider,
+                    "summary_model": summary_model,
+                    "summary": summary,
                 }
-            )
+            except HTTPException as exc:
+                last_error = exc
+                should_retry = allow_fallback and index < len(provider_candidates) - 1 and _should_try_next_provider(exc)
+                if not should_retry:
+                    raise
+                logger.warning("Auto provider fallback after %s summary failure", resolved_provider)
 
-        status = result.get("status", "unknown").lower()
-        logger.debug(f"Summary status for meeting {meeting_id}: {status}, error: {result.get('error')}")
+        if last_error:
+            raise last_error
+        raise HTTPException(status_code=500, detail="Unable to process summary request.")
 
-        # Parse result data if available
-        summary_data = None
-        if result.get("result"):
-            try:
-                parsed_result = json.loads(result["result"])
-                if isinstance(parsed_result, str):
-                    summary_data = json.loads(parsed_result)
-                else:
-                    summary_data = parsed_result
-                if not isinstance(summary_data, dict):
-                    logger.error(f"Parsed summary data is not a dictionary for meeting {meeting_id}")
-                    summary_data = None
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON data for meeting {meeting_id}: {str(e)}")
-                status = "failed"
-                result["error"] = f"Invalid summary data format: {str(e)}"
-            except Exception as e:
-                logger.error(f"Unexpected error parsing summary data for {meeting_id}: {str(e)}")
-                status = "failed"
-                result["error"] = f"Error processing summary data: {str(e)}"
+    @app.post("/api/process-audio", response_model=ProcessAudioResponse)
+    async def process_audio(
+        file: UploadFile = File(...),
+        provider: str = Form(DEFAULT_PROVIDER),
+        transcription_model: str | None = Form(None),
+        summary_model: str | None = Form(None),
+    ) -> ProcessAudioResponse:
+        temp_path, file_size = await _save_upload_to_temp(file)
+        provider_candidates = _resolve_provider_candidates(provider)
+        allow_fallback = _can_auto_fallback(provider, transcription_model, summary_model)
 
-        # Transform summary data into frontend format if available - PRESERVE ORDER
-        transformed_data = {}
-        if isinstance(summary_data, dict) and status == "completed":
-            # Add MeetingName to transformed data
-            transformed_data["MeetingName"] = summary_data.get("MeetingName", "")
-
-            # Map backend sections to frontend sections
-            section_mapping = {
-                # "SessionSummary": "key_points",
-                # "ImmediateActionItems": "action_items",
-                # "KeyItemsDecisions": "decisions",
-                # "NextSteps": "next_steps",
-                # "CriticalDeadlines": "critical_deadlines",
-                # "People": "people"
-            }
-
-            # Add each section to transformed data
-            for backend_key, frontend_key in section_mapping.items():
-                if backend_key in summary_data and isinstance(summary_data[backend_key], dict):
-                    transformed_data[frontend_key] = summary_data[backend_key]
-            
-            # Add meeting notes sections if available - PRESERVE ORDER AND HANDLE DUPLICATES
-            if "MeetingNotes" in summary_data and isinstance(summary_data["MeetingNotes"], dict):
-                meeting_notes = summary_data["MeetingNotes"]
-                if isinstance(meeting_notes.get("sections"), list):
-                    # Add section order array to maintain order
-                    transformed_data["_section_order"] = []
-                    used_keys = set()
-                    
-                    for index, section in enumerate(meeting_notes["sections"]):
-                        if isinstance(section, dict) and "title" in section and "blocks" in section:
-                            # Ensure blocks is a list to prevent frontend errors
-                            if not isinstance(section.get("blocks"), list):
-                                section["blocks"] = []
-                                
-                            # Convert title to snake_case key
-                            base_key = section["title"].lower().replace(" & ", "_").replace(" ", "_")
-                            
-                            # Handle duplicate section names by adding index
-                            key = base_key
-                            if key in used_keys:
-                                key = f"{base_key}_{index}"
-                            
-                            used_keys.add(key)
-                            transformed_data[key] = section
-                            # Only add to _section_order if the section was successfully added
-                            transformed_data["_section_order"].append(key)
-
-        response = {
-            "status": "processing" if status in ["processing", "pending", "started"] else status,
-            "meetingName": summary_data.get("MeetingName") if isinstance(summary_data, dict) else None,
-            "meeting_id": meeting_id,
-            "start": result.get("start_time"),
-            "end": result.get("end_time"),
-            "data": transformed_data if status == "completed" else None
-        }
-
-        if status == "failed":
-            response["status"] = "error"
-            response["error"] = result.get("error", "Unknown processing error")
-            response["data"] = None
-            response["meetingName"] = None
-            logger.info(f"Returning failed status with error: {response['error']}")
-            return JSONResponse(status_code=400, content=response)
-
-        elif status in ["processing", "pending", "started"]:
-            response["data"] = None
-            return JSONResponse(status_code=202, content=response)
-
-        elif status == "completed":
-            if not summary_data:
-                response["status"] = "error"
-                response["error"] = "Completed but summary data is missing or invalid"
-                response["data"] = None
-                response["meetingName"] = None
-                return JSONResponse(status_code=500, content=response)
-            return JSONResponse(status_code=200, content=response)
-
-        else:
-            response["status"] = "error"
-            response["error"] = f"Unknown or unexpected status: {status}"
-            response["data"] = None
-            response["meetingName"] = None
-            return JSONResponse(status_code=500, content=response)
-
-    except Exception as e:
-        logger.error(f"Error getting summary for {meeting_id}: {str(e)}", exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "meetingName": None,
-                "meeting_id": meeting_id,
-                "data": None,
-                "start": None,
-                "end": None,
-                "error": f"Internal server error: {str(e)}"
-            }
+        logger.info(
+            "Processing upload filename=%s size_bytes=%s provider=%s",
+            file.filename,
+            file_size,
+            provider,
         )
 
-@app.post("/save-transcript")
-async def save_transcript(request: SaveTranscriptRequest):
-    """Save transcript segments for a meeting without processing"""
-    try:
-        logger.info(f"Received save-transcript request for meeting: {request.meeting_title}")
-        logger.info(f"Number of transcripts to save: {len(request.transcripts)}")
+        try:
+            last_error: HTTPException | None = None
+            for index, resolved_provider in enumerate(provider_candidates):
+                selected_transcription_model = transcription_model or _default_transcription_model(resolved_provider)
+                selected_summary_model = summary_model or _default_summary_model(resolved_provider)
+                try:
+                    transcript = await _request_transcription(
+                        file_path=temp_path,
+                        filename=file.filename or temp_path.name,
+                        content_type=file.content_type,
+                        provider=resolved_provider,
+                        model=selected_transcription_model,
+                    )
+                    summary = await _build_summary(transcript, resolved_provider, selected_summary_model)
+                    return ProcessAudioResponse(
+                        provider=resolved_provider,
+                        transcription_model=selected_transcription_model,
+                        summary_model=selected_summary_model,
+                        filename=file.filename or temp_path.name,
+                        transcript=transcript,
+                        summary=summary,
+                    )
+                except HTTPException as exc:
+                    last_error = exc
+                    should_retry = allow_fallback and index < len(provider_candidates) - 1 and _should_try_next_provider(exc)
+                    if not should_retry:
+                        raise
+                    logger.warning("Auto provider fallback after %s process-audio failure", resolved_provider)
+            if last_error:
+                raise last_error
+            raise HTTPException(status_code=500, detail="Unable to process audio request.")
+        finally:
+            temp_path.unlink(missing_ok=True)
 
-        # Log first transcript timestamps for debugging
-        if request.transcripts:
-            first = request.transcripts[0]
-            logger.debug(f"First transcript: audio_start_time={first.audio_start_time}, audio_end_time={first.audio_end_time}, duration={first.duration}")
+    return app
 
-        # Generate a unique meeting ID
-        meeting_id = f"meeting-{int(time.time() * 1000)}"
 
-        # Save the meeting with folder path (if provided)
-        await db.save_meeting(meeting_id, request.meeting_title, folder_path=request.folder_path)
+app = create_app()
 
-        # Save each transcript segment with NEW timestamp fields for playback sync
-        for transcript in request.transcripts:
-            await db.save_meeting_transcript(
-                meeting_id=meeting_id,
-                transcript=transcript.text,
-                timestamp=transcript.timestamp,
-                summary="",
-                action_items="",
-                key_points="",
-                # NEW: Recording-relative timestamps for audio-transcript synchronization
-                audio_start_time=transcript.audio_start_time,
-                audio_end_time=transcript.audio_end_time,
-                duration=transcript.duration
-            )
-
-        logger.info("Transcripts saved successfully")
-        return {"status": "success", "message": "Transcript saved successfully", "meeting_id": meeting_id}
-    except Exception as e:
-        logger.error(f"Error saving transcript: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/get-model-config")
-async def get_model_config():
-    """Get the current model configuration"""
-    model_config = await db.get_model_config()
-    if model_config:
-        api_key = await db.get_api_key(model_config["provider"])
-        if api_key != None:
-            model_config["apiKey"] = api_key
-    return model_config
-
-@app.post("/save-model-config")
-async def save_model_config(request: SaveModelConfigRequest):
-    """Save the model configuration"""
-    await db.save_model_config(request.provider, request.model, request.whisperModel)
-    if request.apiKey != None:
-        await db.save_api_key(request.apiKey, request.provider)
-    return {"status": "success", "message": "Model configuration saved successfully"}  
-
-@app.get("/get-transcript-config")
-async def get_transcript_config():
-    """Get the current transcript configuration"""
-    transcript_config = await db.get_transcript_config()
-    if transcript_config:
-        transcript_api_key = await db.get_transcript_api_key(transcript_config["provider"])
-        if transcript_api_key != None:
-            transcript_config["apiKey"] = transcript_api_key
-    return transcript_config
-
-@app.post("/save-transcript-config")
-async def save_transcript_config(request: SaveTranscriptConfigRequest):
-    """Save the transcript configuration"""
-    await db.save_transcript_config(request.provider, request.model)
-    if request.apiKey != None:
-        await db.save_transcript_api_key(request.apiKey, request.provider)
-    return {"status": "success", "message": "Transcript configuration saved successfully"}
-
-class GetApiKeyRequest(BaseModel):
-    provider: str
-
-@app.post("/get-api-key")
-async def get_api_key(request: GetApiKeyRequest):
-    try:
-        return await db.get_api_key(request.provider)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/get-transcript-api-key")
-async def get_transcript_api_key(request: GetApiKeyRequest):
-    try:
-        return await db.get_transcript_api_key(request.provider)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-class MeetingSummaryUpdate(BaseModel):
-    meeting_id: str
-    summary: dict
-
-@app.post("/save-meeting-summary")
-async def save_meeting_summary(data: MeetingSummaryUpdate):
-    """Save a meeting summary"""
-    try:
-        await db.update_meeting_summary(data.meeting_id, data.summary)
-        return {"message": "Meeting summary saved successfully"}
-    except ValueError as ve:
-        logger.error(f"Value error saving meeting summary: {str(ve)}")
-        raise HTTPException(status_code=404, detail=str(ve))
-    except Exception as e:
-        logger.error(f"Error saving meeting summary: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-class SearchRequest(BaseModel):
-    query: str
-
-@app.post("/search-transcripts")
-async def search_transcripts(request: SearchRequest):
-    """Search through meeting transcripts for the given query"""
-    try:
-        results = await db.search_transcripts(request.query)
-        return JSONResponse(content=results)
-    except Exception as e:
-        logger.error(f"Error searching transcripts: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on API shutdown"""
-    logger.info("API shutting down, cleaning up resources")
-    try:
-        processor.cleanup()
-        logger.info("Successfully cleaned up resources")
-    except Exception as e:
-        logger.error(f"Error during cleanup: {str(e)}", exc_info=True)
 
 if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.freeze_support()
-    uvicorn.run("main:app", host="0.0.0.0", port=5167, reload=True)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "5167")), reload=True)

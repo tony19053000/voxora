@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: voxora-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: DEFAULT_AI_PROVIDER
+        value: auto
+      - key: MAX_UPLOAD_MB
+        value: 25
+      - key: SUMMARY_CHUNK_CHARS
+        value: 12000
+      - key: SUMMARY_CHUNK_OVERLAP
+        value: 500
+      - key: CORS_ORIGINS
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+
+  - type: static_site
+    name: voxora-web
+    rootDir: frontend
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
+    staticPublishPath: out
+    pullRequestPreviewsEnabled: false
+    envVars:
+      - key: NEXT_PUBLIC_API_BASE_URL
+        sync: false

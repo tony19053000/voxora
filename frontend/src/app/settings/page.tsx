@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { ArrowLeft, Settings2, Mic, Database as DatabaseIcon, SparkleIcon, FlaskConical } from 'lucide-react';
+import dynamic from 'next/dynamic';
 import { useRouter } from 'next/navigation';
 import { invoke } from '@tauri-apps/api/core';
 import { motion } from 'framer-motion';
@@ -22,7 +23,7 @@ const TABS = [
   { value: 'beta', label: 'Beta', icon: FlaskConical }
 ] as const;
 
-export default function SettingsPage() {
+function SettingsPageInner() {
   const router = useRouter();
   const { transcriptModelConfig, setTranscriptModelConfig } = useConfig();
 
@@ -132,4 +133,8 @@ export default function SettingsPage() {
       </div>
     </div>
   );
-};
+}
+
+export default dynamic(() => Promise.resolve(SettingsPageInner), {
+  ssr: false,
+});
