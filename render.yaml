@@ -22,12 +22,16 @@ services:
       - key: GROQ_API_KEY
         sync: false
 
-  - type: static_site
+  - type: web
     name: voxora-web
+    runtime: static
     rootDir: frontend
     buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
     staticPublishPath: out
     pullRequestPreviewsEnabled: false
     envVars:
       - key: NEXT_PUBLIC_API_BASE_URL
-        sync: false
+        fromService:
+          type: web
+          name: voxora-backend
+          envVarKey: RENDER_EXTERNAL_URL
